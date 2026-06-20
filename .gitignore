@@ -1,0 +1,81 @@
+# =========================
+# Python general
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# =========================
+# Virtual environments
+# =========================
+venv/
+.env/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# =========================
+# Jupyter / notebooks
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Environment variables
+# =========================
+.env
+
+# =========================
+# Logs & temp files
+# =========================
+*.log
+*.tmp
+*.swp
+*.swo
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# IDEs / editors
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# Data (IMPORTANT)
+# =========================
+# Ignore ALL raw data
+data/
+
+# =========================
+# Model / outputs
+# =========================
+models/
+outputs/
+artifacts/
+*.pkl
+*.joblib
+
+# Large local sample (the small sample/ci_sample.csv is kept for CI/Docker)
+sample/sample.csv
+Sample.csv
+
+
+# =========================
+# Build / packaging
+# =========================
+build/
+dist/
+*.egg-info/
+
+# =========================
+# Misc
+# =========================
+*.bak
+*.cache
