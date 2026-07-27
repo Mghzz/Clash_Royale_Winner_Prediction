@@ -66,6 +66,12 @@ artifacts/
 sample/sample.csv
 Sample.csv
 
+# =========================
+# MLflow
+# =========================
+mlruns/
+mlflow.db
+
 
 # =========================
 # Build / packaging

@@ -1,0 +1,759 @@
+================================================================================
+CLASH ROYALE WINNER PREDICTION - PROJECT OVERVIEW
+================================================================================
+(Docker-related files are intentionally excluded from this document, as
+ requested. See Dockerfile / docker-compose.yml / .dockerignore in the repo
+ if you need that information.)
+
+--------------------------------------------------------------------------------
+1. WHAT THIS PROJECT DOES
+--------------------------------------------------------------------------------
+This project predicts the winner of a Clash Royale match (the mobile game by
+Supercell), end to end: from raw CSV to a trained, evaluated model that writes
+predictions into the database.
+
+The core idea:
+  - Each Clash Royale match has two players (a "winner" and a "loser" in the
+    raw data).
+  - The problem is framed as a COMPARISON between two players, "A" and "B".
+  - Every row in the final, model-ready dataset represents ONE match, with
+    both players' pre-match features side by side, plus a binary target
+    column `is_A_winner` (1 if player A won, 0 if player B won).
+  - Which raw side (winner/loser) becomes "A" and which becomes "B" is
+    randomized (with a fixed seed) so the model cannot cheat by learning that
+    "A always wins".
+
+The project has two parts:
+  1. DATA ENGINEERING (Phase 1-2): ingest a large raw CSV of historical
+     matches into a normalized PostgreSQL database, clean it, and engineer
+     comparison features into a model-ready table.
+  2. MODELING (Phase 3): select, train, tune, and evaluate several
+     classifiers (including a neural network) to predict `is_A_winner`,
+     track every experiment in MLflow, register the best model, and use it
+     to generate predictions that are written back to the database.
+
+It also includes two Jupyter notebooks for data understanding and
+exploratory data analysis (EDA), and a GitHub Actions CI workflow that
+exercises the data-engineering pipeline automatically on every push/PR.
+
+--------------------------------------------------------------------------------
+2. HIGH-LEVEL DATA FLOW / PIPELINE
+--------------------------------------------------------------------------------
+
+    Raw CSV (one row per match; winner.* / loser.* columns)
+            |
+            v
+    scripts/load_data.py          STAGE 1: Load
+       - Parses the raw CSV in chunks
+       - Splits it into normalized relational tables:
+         Match, MatchPlayer, MatchPlayerCard, Card, Clan
+       - Writes them into PostgreSQL
+            |
+            v
+    scripts/preprocess.py         STAGE 2: Clean / Preprocess
+       - Reads match data back out of Postgres via a SQL query that
+         self-joins the winner and loser MatchPlayer rows into a single
+         wide row per match (w_* / l_* columns), plus aggregated per-side
+         card stats. Retains "match_id" as a passthrough identifier column
+         (needed later to tie predictions back to a specific match).
+       - Cleans data: fixes types, imputes missing numeric values with the
+         median, drops fully-empty columns (e.g. tournamentTag), clips
+         negative HP values, frequency-encodes clan tags, adds time-based
+         features (hour/day-of-week/month/weekend).
+       - Writes the result to the `preprocessed_match` table (and optionally
+         to artifacts/preprocessed_data.csv).
+            |
+            v
+    scripts/feature_engineering.py   STAGE 3: Feature Engineering
+       - Reads `preprocessed_match`.
+       - Randomly (seeded) relabels the winner/loser sides as A/B so the
+         target isn't trivially predictable from column order.
+       - Builds the target column `is_A_winner`.
+       - Builds comparison features: `diff_*` (A minus B) and `ratio_*`
+         (A divided by B) for each shared numeric feature, plus composite
+         features like `deck_density` and `card_power_index` per side.
+       - Adds cyclical encodings of time (hour_sin/cos, dow_sin/cos).
+       - Drops near-constant and highly-correlated columns (configurable
+         correlation threshold, default 0.95). `match_id` is explicitly
+         excluded from this check (it's an identifier, not a feature).
+       - Scales all remaining numeric columns with scikit-learn's
+         StandardScaler (excluding the target, `match_id`, and a few
+         categorical/cyclical flags), and saves the fitted scaler for reuse.
+       - Writes the result to the `model_ready_match` table (and optionally
+         to artifacts/model_ready_data.csv), and saves the scaler
+         (artifacts/scaler.pkl).
+            |
+            v
+    scripts/train_model.py        STAGE 4: Model Selection & Training
+       - Reads `model_ready_match`.
+       - Drops data-leakage columns (see section 3 below) before doing
+         anything else.
+       - Splits into train/validation/test (70/15/15, stratified on
+         `is_A_winner`, seeded).
+       - Trains 4 candidate classifiers -- Logistic Regression, Random
+         Forest, XGBoost, and a Neural Network (scikit-learn's
+         MLPClassifier) -- each tuned with GridSearchCV (5-fold
+         cross-validation over a small regularization/hyperparameter grid).
+       - Logs every candidate's params, CV score, validation metrics, and
+         the fitted model itself to MLflow (one run per candidate).
+       - Picks the candidate with the best validation ROC-AUC -- all 4
+         models, including the neural network, are compared on equal
+         footing, so whichever genuinely performs best is chosen.
+       - Evaluates the winning model once on the held-out test set
+         (accuracy, precision, recall, F1, ROC-AUC, confusion matrix),
+         logging all of it to the same MLflow run.
+       - Registers the winning model in the MLflow Model Registry and
+         also saves a plain joblib bundle (model + feature column list) to
+         artifacts/best_model.joblib for simple reuse without retraining.
+            |
+            v
+    scripts/make_predictions.py   STAGE 5: Prediction
+       - Reads `preprocessed_match` (the matches to score).
+       - Rebuilds the exact same A_*/B_*/diff_*/ratio_* features using the
+         same add_features() function from feature_engineering.py (no
+         duplicated logic).
+       - Applies the SAVED scaler (artifacts/scaler.pkl) with .transform()
+         only -- never refit -- so new data is scaled exactly like the
+         training data was.
+       - Loads the SAVED model (artifacts/best_model.joblib) and predicts.
+         Does NOT retrain anything.
+       - Writes match_id, predicted_label, predicted_probability, and (when
+         available) actual_is_A_winner to a new `match_predictions` table
+         in PostgreSQL.
+
+    run_pipeline.py runs all five stages above, in order, from one command.
+    (pipeline.py still exists and runs only stages 1-3, the original
+    data-engineering-only entry point.)
+
+Design notes:
+  - The database is treated as the source of truth. Each stage reads its
+    input from the database and writes its output back, so stages can be
+    re-run independently once the stage(s) before them have populated their
+    input table.
+  - The database itself stays fully normalized (two MatchPlayer rows per
+    match: one winner, one loser). The "one row per match" / "A vs B" shape
+    is only materialized by pipeline code (SQL query + pandas), never stored
+    that way permanently in the DB schema.
+  - `match_id` flows all the way through preprocessed_match -> model_ready_match
+    as a plain identifier column. It is never used as a model feature (it's
+    explicitly excluded from scaling, from correlation/near-constant checks,
+    and from the training feature set), but it lets stage 5 tie predictions
+    back to a specific match.
+
+--------------------------------------------------------------------------------
+3. DATA LEAKAGE: WHAT IT IS AND HOW IT'S HANDLED
+--------------------------------------------------------------------------------
+Columns such as `crowns`, `kingTowerHitPoints`, `princessTowersHitPoints`, and
+`trophyChange` are recorded AFTER the match ends -- a real pre-match predictor
+must never see them.
+
+  - They ARE still present in `model_ready_match` (kept for completeness /
+    other analyses, e.g. post-hoc auditing), as `A_*`, `B_*`, `diff_*`
+    variants (and occasionally `ratio_*`, though none of these four
+    happen to be in the ratio feature list).
+  - `scripts/train_model.py::drop_leakage_columns()` removes any column
+    whose name contains "crowns", "kingTowerHitPoints",
+    "princessTowersHitPoints", or "trophyChange" BEFORE splitting the data
+    or training anything. This automatically catches every `A_*`/`B_*`/
+    `diff_*`/`ratio_*` variant of each leakage field.
+  - The EDA notebook (`eda.ipynb`) also excludes these columns from its
+    analysis for the same reason.
+
+--------------------------------------------------------------------------------
+4. DATABASE SCHEMA (schema.sql)
+--------------------------------------------------------------------------------
+PostgreSQL schema, defined once in schema.sql and treated as the single
+source of truth (scripts/database_connection.py applies it automatically on
+first run via `ensure_schema`).
+
+Tables:
+
+  Clan
+    - tag (PK, VARCHAR)         Clan tag identifier
+    - badgeId (INT)             Clan badge/icon id
+
+  Card
+    - id (PK, INT)              Unique card id (Clash Royale card catalog)
+
+  Match
+    - id (PK, auto-increment)
+    - battleTime (TIMESTAMP)    When the match happened
+    - arena_id (INT)            Arena/league the match took place in
+    - gameMode_id (INT)         Game mode identifier
+    - tournamentTag (VARCHAR)   Tournament identifier (often empty/null)
+    - average_startingTrophies (DOUBLE PRECISION)  Avg trophies of both players
+
+  MatchPlayer  (one row per player per match -> 2 rows per match)
+    - id (PK, auto-increment)
+    - match_id (FK -> Match.id)
+    - player_tag (VARCHAR)
+    - clan_tag (FK -> Clan.tag, nullable)
+    - is_winner (BOOLEAN)        TARGET VARIABLE for this table; whether this
+                                  player won the match
+    - startingTrophies (DOUBLE PRECISION)
+    - elixir_average (DOUBLE PRECISION)
+    - totalcard_level (INT)
+    - troop_count, structure_count, spell_count (INT)  deck composition
+    - common_count, rare_count, epic_count, legendary_count (INT) rarity mix
+    - trophyChange (DOUBLE PRECISION)     post-match; leakage if predicting pre-match
+    - crowns (DOUBLE PRECISION)           post-match; leakage
+    - kingTowerHitPoints (DOUBLE PRECISION)        post-match; leakage
+    - princessTowersHitPoints (DOUBLE PRECISION)   post-match; leakage.
+        Comment in schema: "Total HP of the standing princess towers (sum of
+        the list-encoded source values, 0 when both are destroyed)"
+
+  MatchPlayerCard  (many-to-many: which cards each player used, and at what level)
+    - match_player_id (FK -> MatchPlayer.id)
+    - card_id (FK -> Card.id)
+    - card_level (INT)
+    - PRIMARY KEY (match_player_id, card_id)
+
+A visual ER diagram is provided in schema.png.
+
+--------------------------------------------------------------------------------
+5. DERIVED / PIPELINE-OUTPUT TABLES (not in schema.sql; created at runtime)
+--------------------------------------------------------------------------------
+
+  preprocessed_match   (written by scripts/preprocess.py)
+    One row per match, plus a `match_id` identifier column. Built from a
+    query that joins the winner MatchPlayer row (aliased "w_*") and loser
+    MatchPlayer row (aliased "l_*") together with match-level fields and
+    per-side aggregated card stats (num_cards, avg/std/min/max card_level,
+    high_level_cards count). Also includes derived time features:
+    battle_hour, battle_dayofweek, battle_month, is_weekend, and
+    clan_tag_freq (frequency encoding).
+
+  model_ready_match   (written by scripts/feature_engineering.py)
+    The feature matrix used for modeling. Contains:
+      - match_id            (identifier, not a feature)
+      - A_* / B_* columns   (winner/loser randomly reassigned to A/B)
+      - diff_* columns      (A - B for each shared numeric feature)
+      - ratio_* columns     (A / B for a subset of features)
+      - A_deck_density / B_deck_density, diff_deck_density
+      - A_card_power_index / B_card_power_index, diff_card_power_index
+      - hour_sin/cos, dow_sin/cos (cyclical time encodings)
+      - is_A_winner (the prediction TARGET)
+    All numeric columns (except match_id, the target, and cyclical/flag
+    columns) are standardized (zero mean, unit variance) via scikit-learn's
+    StandardScaler. Near-constant and highly-correlated (>0.95 by default)
+    columns are dropped before scaling. NOTE: leakage columns (crowns,
+    kingTowerHitPoints, princessTowersHitPoints, trophyChange, and their
+    variants) are still present here -- they are removed later, at training
+    time, by scripts/train_model.py.
+
+  match_predictions   (written by scripts/make_predictions.py)
+    - match_id                  identifies which match this prediction is for
+    - predicted_label           the model's predicted is_A_winner (0 or 1)
+    - predicted_probability     the model's predicted probability of A winning
+    - actual_is_A_winner        the true label, when available (for auditing)
+
+--------------------------------------------------------------------------------
+6. MODEL TRAINING, EVALUATION & MLFLOW DETAILS
+--------------------------------------------------------------------------------
+File: scripts/train_model.py
+
+Leakage removal & split:
+  - drop_leakage_columns(): drops any column containing "crowns",
+    "kingTowerHitPoints", "princessTowersHitPoints", or "trophyChange".
+  - split_dataset(): separates `match_id` (kept aside, not a feature) and
+    `is_A_winner` (target) from the remaining feature columns, then does a
+    stratified 70/15/15 train/validation/test split (seeded, default 42).
+
+Candidate models (all scikit-learn API compatible, all tuned with
+GridSearchCV(cv=5, scoring="roc_auc")):
+  - Logistic Regression   -- grid over `C` (L2 regularization strength)
+  - Random Forest         -- grid over `n_estimators`, `max_depth`,
+                              `min_samples_leaf` (depth/leaf-size = regularization)
+  - XGBoost                -- grid over `max_depth`, `learning_rate`,
+                              `reg_alpha` (L1 regularization)
+  - Neural Network (MLPClassifier, with early stopping) -- grid over
+    `hidden_layer_sizes`, `alpha` (L2 regularization)
+
+MLflow tracking:
+  - Tracking URI: a local SQLite database, `sqlite:///mlflow.db` (required
+    for the MLflow Model Registry to work; the plain file store does not
+    support model registration).
+  - Experiment name: "clash_royale_winner_prediction".
+  - One MLflow run per candidate model, logging: best hyperparameters
+    found, the cross-validation ROC-AUC score, validation-set metrics
+    (accuracy, precision, recall, F1, ROC-AUC), and the fitted model itself
+    (via mlflow.sklearn.log_model, cloudpickle serialization format -- used
+    uniformly for all 4 models, including XGBoost, since they're all
+    scikit-learn API compatible).
+
+Model selection:
+  - select_best() picks the candidate with the highest validation ROC-AUC.
+    All 4 candidates -- including the neural network -- are compared purely
+    on this metric; there is no built-in bias toward any particular model
+    type.
+
+Final evaluation (on the untouched test set), via evaluate_on_test():
+  - Computes accuracy, precision, recall, F1, and ROC-AUC.
+  - Generates a confusion matrix, saved as artifacts/confusion_matrix.png.
+  - Logs all test metrics and the confusion-matrix image to the SAME MLflow
+    run as the winning candidate (resumed via its run_id), so everything
+    about the winning model lives in one place.
+  - Prints a scikit-learn classification_report to the console.
+
+Registration & persistence, via register_best_model():
+  - Registers the winning model in the MLflow Model Registry under the name
+    "clash_royale_winner_predictor" (mlflow.register_model).
+  - Also saves a plain joblib bundle to artifacts/best_model.joblib:
+    {"model": <fitted estimator>, "feature_columns": [...], "model_name": "..."}.
+    This lets scripts/make_predictions.py load the model directly, without
+    needing a running MLflow server.
+
+--------------------------------------------------------------------------------
+7. PREDICTION SCRIPT DETAILS
+--------------------------------------------------------------------------------
+File: scripts/make_predictions.py
+
+  - load_model_bundle() / load_scaler_bundle(): load
+    artifacts/best_model.joblib and artifacts/scaler.pkl via joblib.
+  - apply_saved_scaler(): calls the saved scaler's .transform() (never
+    .fit_transform()) on exactly the columns it was fit on during training,
+    so new data is scaled identically to the training data.
+  - predict(): rebuilds features from raw preprocessed_match-shaped data
+    using feature_engineering.add_features(), applies the saved scaler,
+    reindexes the result to the exact feature_columns list the model was
+    trained on (this also naturally drops leakage/redundant columns and
+    match_id/target, and guarantees correct column order), then calls the
+    saved model's .predict() and .predict_proba(). Never retrains anything.
+  - run_predictions(): orchestrates the above against the database (or an
+    optional input CSV) and writes the result to the `match_predictions`
+    table via the existing write_table() helper.
+  - Has the same `--input-path` convention as scripts/preprocess.py and
+    scripts/feature_engineering.py: no path reads straight from Postgres
+    (`preprocessed_match`, assumed already preprocessed); a path reads a CSV
+    in the same w_*/l_* shape and re-runs preprocess_dataframe() on it first.
+
+--------------------------------------------------------------------------------
+8. FULL PROJECT FILE STRUCTURE (excluding Docker-specific files)
+--------------------------------------------------------------------------------
+
+Clash_Royale_Winner_Prediction/
+|
+|-- README.md
+|       Main project documentation: pipeline overview (all 5 stages), project
+|       structure, setup instructions, how to run the pipeline (all-in-one via
+|       run_pipeline.py, the data-engineering-only pipeline.py, or stage by
+|       stage), output table/file descriptions, MLflow UI instructions, EDA
+|       notes, and CI notes.
+|
+|-- schema.sql
+|       Canonical PostgreSQL DDL (source of truth) defining the Clan, Card,
+|       Match, MatchPlayer, and MatchPlayerCard tables, including foreign
+|       keys and column comments. Applied automatically at pipeline startup.
+|
+|-- schema.png
+|       Entity-relationship diagram image illustrating the schema above.
+|
+|-- pipeline.py
+|       Orchestrator for the data-engineering stages only. Parses CLI
+|       arguments (--csv-path, --chunk-size, --limit-rows, --no-reset,
+|       --preprocessed-path, --featured-path) and calls, in order:
+|       load_csv_to_postgres() (stage 1), run_preprocess() (stage 2), and
+|       run_feature_engineering() (stage 3). Kept as the original
+|       data-engineering-only entry point.
+|
+|-- run_pipeline.py
+|       The full end-to-end orchestrator (stages 1-5). Same CLI arguments as
+|       pipeline.py, plus --seed (controls both the A/B side assignment and
+|       the train/val/test split). Calls, in order: load_csv_to_postgres()
+|       -> run_preprocess() -> run_feature_engineering() -> train_model's
+|       load_dataset()+run_training() -> make_predictions's run_predictions().
+|       This is the single command that takes a raw CSV all the way to
+|       predictions stored in the database.
+|
+|-- make_sample_csv.py
+|       Utility script to create a smaller CSV sample from a large raw CSV
+|       (e.g., for committing a GitHub-safe sample). Takes --input-path,
+|       --output-path, and --rows (default 100,000) and writes the first N
+|       rows of the source file to a new CSV.
+|
+|-- requirements.txt
+|       Python dependency list: pandas, numpy, sqlalchemy, psycopg2-binary,
+|       scikit-learn, python-dotenv, matplotlib, seaborn, mlflow, xgboost.
+|
+|-- eda.ipynb
+|       Exploratory Data Analysis notebook (project phase 2). Covers: dataset
+|       overview, missing values, the modeling target, winner-vs-loser
+|       pre-match distributions and trophy/elixir/card-level gaps, a
+|       "does the higher pre-match value tend to win?" analysis, outlier
+|       checks, correlation of the gaps with the outcome, time-based
+|       patterns (hour/day/month), and card usage frequency. Reads from the
+|       `preprocessed_match` DB table (falls back to
+|       artifacts/preprocessed_data.csv if the DB isn't reachable). Excludes
+|       post-match/leakage columns from the analysis.
+|
+|-- data_understanding.ipynb
+|       Earlier/simpler notebook: first look at the raw CSV
+|       (BattlesStaging_01012021_WL_tagged.csv). Prints column names, a
+|       sample of rows, total row count (~2.82 million rows), and shows
+|       that the file can be read in chunks (e.g., chunks of 100,000 rows)
+|       for memory-efficient processing.
+|
+|-- .gitignore
+|       Excludes: Python caches/venvs, Jupyter checkpoints, .env secrets,
+|       logs/temp files, OS/IDE files, the entire data/ directory (raw data
+|       is not committed), models/outputs/artifacts/*.pkl/*.joblib (pipeline
+|       outputs), the large sample/sample.csv (only the small
+|       sample/ci_sample.csv is kept for CI/Docker), the MLflow tracking
+|       store (mlruns/, mlflow.db), and build/dist output.
+|
+|-- .dockerignore
+|       (Docker-related; not detailed further per request.)
+|
+|-- Dockerfile
+|       (Docker-related; not detailed further per request.)
+|
+|-- docker-compose.yml
+|       (Docker-related; not detailed further per request.)
+|
+|-- .github/
+|   `-- workflows/
+|       `-- ci.yml
+|               GitHub Actions CI workflow ("Data Pipeline CI"). Triggers on
+|               every push and pull request to `main`. Spins up an ephemeral
+|               postgres:16 service container, installs Python 3.12 and the
+|               dependencies from requirements.txt, compile-checks all
+|               source files (`python -m compileall scripts pipeline.py`),
+|               and finally runs the data-engineering pipeline (pipeline.py,
+|               stages 1-3) against the small committed sample file
+|               `sample/ci_sample.csv`. The build passes only if the
+|               pipeline completes without error. (Does not currently run
+|               the modeling stages; see "possible follow-up work" below.)
+|
+|-- scripts/                            (Python package: the pipeline logic)
+|   |-- __init__.py
+|   |       Empty file; marks `scripts` as a Python package so it can be
+|   |       imported as `scripts.load_data`, `scripts.preprocess`, etc.
+|   |
+|   |-- database_connection.py
+|   |       Central module for all DB access and shared constants:
+|   |         - Loads DB credentials from a .env file (DB_HOST, DB_PORT,
+|   |           DB_NAME, DB_USER, DB_PASSWORD) via python-dotenv.
+|   |         - get_database_url() / get_engine(): build a SQLAlchemy engine
+|   |           for postgresql+psycopg2.
+|   |         - ensure_schema(engine): reads schema.sql (falling back to an
+|   |           embedded copy of the DDL) and executes each statement,
+|   |           creating tables if they don't already exist.
+|   |         - reset_tables(engine): TRUNCATEs all tables (with CASCADE and
+|   |           identity restart) for a clean reload.
+|   |         - PREPROCESSED_TABLE = "preprocessed_match" and
+|   |           FEATURES_TABLE = "model_ready_match" table-name constants.
+|   |         - PER_SIDE_NUMERIC / PER_SIDE_CARD_AGG / MATCH_NUMERIC: shared
+|   |           lists of column names reused across preprocessing and
+|   |           feature engineering.
+|   |         - write_table() / read_table(): thin wrappers around
+|   |           pandas.DataFrame.to_sql / read_sql_table.
+|   |         - build_match_base_query(): constructs the big SQL query that
+|   |           self-joins Match + winner MatchPlayer (w_*) + loser
+|   |           MatchPlayer (l_*) + their aggregated card stats (via a
+|   |           card_agg CTE) + clan badge info, producing one row per match,
+|   |           including a `match_id` identifier column.
+|   |
+|   |-- load_data.py                    STAGE 1 of the pipeline
+|   |       Reads the raw wide-format CSV (winner.*/loser.* columns) in
+|   |       chunks (default chunk size 5000) and, for each chunk:
+|   |         - Coerces battleTime to datetime and numeric columns to
+|   |           numeric types; specially parses princessTowersHitPoints,
+|   |           which may be stored as a list-like string (parse_princess_hp
+|   |           uses ast.literal_eval and sums list values, 0.0 for NaN).
+|   |         - Builds normalized DataFrames for Match, MatchPlayer (one row
+|   |           per side: winner and loser), MatchPlayerCard (one row per
+|   |           card slot 1-8 per player), Card, and Clan, de-duplicating
+|   |           cards/clans already seen in earlier chunks.
+|   |         - Inserts each DataFrame into PostgreSQL using
+|   |           psycopg2.extras.execute_values for fast batched inserts
+|   |           (insert_dataframe / batch_iterable helpers).
+|   |       Exposes load_csv_to_postgres(csv_path, chunk_size, reset,
+|   |       limit_rows) and a CLI (`python -m scripts.load_data --csv-path
+|   |       ...`) with --chunk-size, --no-reset, and --limit-rows options.
+|   |       Calls ensure_schema() and, unless --no-reset is passed,
+|   |       reset_tables() before loading (so re-running is idempotent).
+|   |
+|   |-- preprocess.py                   STAGE 2 of the pipeline
+|   |       preprocess_dataframe(df): the core cleaning function.
+|   |         - Drops columns that are 100% NaN (e.g. tournamentTag in
+|   |           practice).
+|   |         - Converts battleTime to a timezone-naive datetime.
+|   |         - Coerces all known numeric columns (trophies, card counts,
+|   |           HP, etc.) to numeric, then fills missing values with each
+|   |           column's median (or 0 if the whole column is NaN).
+|   |         - Cleans categorical clan_tag columns: casts to string,
+|   |           fills missing/blank with "unknown".
+|   |         - Clips HP columns (kingTowerHitPoints,
+|   |           princessTowersHitPoints) to be >= 0.
+|   |         - Derives time features: battle_hour, battle_dayofweek,
+|   |           battle_month, is_weekend.
+|   |         - Retains the `match_id` identifier column (added by
+|   |           database_connection.build_match_base_query()) as a
+|   |           passthrough, non-feature column, so predictions can later be
+|   |           tied back to a specific match.
+|   |         - Frequency-encodes each clan_tag column into a
+|   |           "<col>_freq" column (proportion of rows sharing that tag).
+|   |         - Drops exact duplicate rows (ignoring match_id, since it is
+|   |           unique per row and would otherwise prevent any duplicate
+|   |           from ever being detected).
+|   |       run_preprocess(output_path, input_path, table_name): reads from
+|   |       the DB (via build_match_base_query()) or an optional input CSV,
+|   |       calls preprocess_dataframe(), writes the result back to the
+|   |       `preprocessed_match` table and optionally to a CSV
+|   |       (default artifacts/preprocessed_data.csv). Also has a CLI
+|   |       (`python -m scripts.preprocess`) with --output-path and
+|   |       --input-path.
+|   |
+|   |-- feature_engineering.py          STAGE 3 of the pipeline
+|   |       assign_ab_sides(df, seed): uses a seeded NumPy random generator
+|   |         to randomly decide, per match, whether winner->A/loser->B or
+|   |         winner->B/loser->A; copies each shared w_*/l_* feature into
+|   |         A_*/B_* columns accordingly, and sets is_A_winner (1 or 0).
+|   |         `match_id` is left untouched (it has no w_/l_ prefix).
+|   |       add_comparison_features(df): computes diff_<feature> (A - B) for
+|   |         every shared numeric comparison feature, ratio_<feature>
+|   |         (A / (B + epsilon)) for a smaller set (trophies, elixir
+|   |         average, avg card level, total card level), and composite
+|   |         per-side indices: deck_density (troop+structure+spell count)
+|   |         and card_power_index (avg_card_level * num_cards +
+|   |         high_level_cards), plus their A-vs-B diffs.
+|   |       add_features(df, assume_preprocessed, seed): orchestrates the
+|   |         above, plus: coerces arena_id/gameMode_id to int (filling
+|   |         missing with -1), builds cyclical sine/cosine encodings of
+|   |         battle_hour and battle_dayofweek, and drops the original raw
+|   |         w_*/l_*/battleTime columns once A_*/B_* versions exist. This
+|   |         function is reused as-is by scripts/make_predictions.py to
+|   |         guarantee predictions see identically-shaped features.
+|   |       drop_redundant_features(df, target, corr_threshold=0.95): drops
+|   |         near-constant columns (<=1 unique value) and one column from
+|   |         each pair of numeric features whose absolute correlation
+|   |         exceeds the threshold. `match_id` is explicitly excluded from
+|   |         this check (it's an identifier, not a candidate feature).
+|   |       standardize_features(df, target, scaler_path): fits a
+|   |         scikit-learn StandardScaler on all remaining numeric columns
+|   |         (excluding the target, match_id, and a few flag/cyclical
+|   |         columns), transforms them in place, and persists the fitted
+|   |         scaler plus the column list to a pickle file (default
+|   |         artifacts/scaler.pkl) via joblib, so the same scaling can be
+|   |         reapplied later during prediction (see scripts/make_predictions.py).
+|   |       run_feature_engineering(...): reads `preprocessed_match` from
+|   |         the DB (or an optional CSV), applies all of the above, writes
+|   |         the result to the `model_ready_match` table and optionally to
+|   |         a CSV (default artifacts/model_ready_data.csv). Also has a CLI
+|   |         (`python -m scripts.feature_engineering`) with --output-path,
+|   |         --input-path, --corr-threshold, --scaler-path, and --seed.
+|   |
+|   |-- train_model.py                  STAGE 4 of the pipeline (see section 6)
+|   |       drop_leakage_columns(df): drops any column containing "crowns",
+|   |         "kingTowerHitPoints", "princessTowersHitPoints", or
+|   |         "trophyChange".
+|   |       load_dataset(table_name): reads `model_ready_match` from Postgres.
+|   |       split_dataset(df, seed): drops leakage columns, then does a
+|   |         stratified 70/15/15 train/val/test split, keeping `match_id`
+|   |         aside (not a feature).
+|   |       evaluate(model, X, y): computes accuracy, precision, recall, F1,
+|   |         and ROC-AUC.
+|   |       plot_confusion_matrix(y_true, y_pred, output_path): saves a
+|   |         confusion-matrix heatmap PNG (default
+|   |         artifacts/confusion_matrix.png).
+|   |       evaluate_on_test(best, X_test, y_test): computes test metrics
+|   |         and the confusion matrix for the winning model, logs them (and
+|   |         the confusion-matrix image) to that model's existing MLflow
+|   |         run, and prints a classification_report.
+|   |       MODEL_CANDIDATES: a dict of the 4 candidate models (Logistic
+|   |         Regression, Random Forest, XGBoost, MLPClassifier neural
+|   |         network) with their estimators and hyperparameter grids.
+|   |       train_candidate(name, spec, X_train, y_train, X_val, y_val):
+|   |         runs GridSearchCV(cv=5, scoring="roc_auc") for one candidate
+|   |         inside its own MLflow run, logging params, CV score,
+|   |         validation metrics, and the fitted model
+|   |         (mlflow.sklearn.log_model, cloudpickle format).
+|   |       select_best(results): returns the candidate with the highest
+|   |         validation ROC-AUC.
+|   |       register_best_model(best, feature_columns): registers the
+|   |         winning model in the MLflow Model Registry
+|   |         ("clash_royale_winner_predictor") and saves
+|   |         artifacts/best_model.joblib (model + feature_columns + model_name).
+|   |       run_training(df, seed): orchestrates the full stage -- split,
+|   |         train all 4 candidates, compare, pick the best, evaluate on
+|   |         the test set, register/save. Also has a CLI
+|   |         (`python -m scripts.train_model`) with --seed.
+|   |
+|   `-- make_predictions.py             STAGE 5 of the pipeline (see section 7)
+|           load_model_bundle(model_path) / load_scaler_bundle(scaler_path):
+|             load the joblib-saved model bundle and scaler bundle.
+|           apply_saved_scaler(df, scaler_bundle): applies the saved
+|             scaler's .transform() (never refit) to the columns it was
+|             originally fit on.
+|           predict(df, model_bundle, scaler_bundle, assume_preprocessed):
+|             rebuilds features via feature_engineering.add_features(),
+|             scales them with the saved scaler, reindexes to the model's
+|             exact feature_columns, and returns a DataFrame of match_id,
+|             predicted_label, predicted_probability, and (if present)
+|             actual_is_A_winner. Never retrains anything.
+|           run_predictions(...): reads `preprocessed_match` from the DB (or
+|             an optional CSV, following the same --input-path convention as
+|             preprocess.py/feature_engineering.py), loads the model and
+|             scaler bundles, calls predict(), and writes the result to the
+|             `match_predictions` table. Also has a CLI
+|             (`python -m scripts.make_predictions`) with --input-path,
+|             --model-path, --scaler-path.
+|
+|-- sample/
+|   `-- ci_sample.csv
+|           A small (~3000-row) sample of the raw match CSV, in the exact
+|           same wide format as the full dataset (battleTime, arena.id,
+|           gameMode.id, winner.*/loser.* columns, card1-8 id/level columns,
+|           cards.list, totals, rarity counts, elixir average, etc.).
+|           Committed to the repo specifically so that CI (ci.yml) and local
+|           Docker testing can run the data-engineering pipeline quickly
+|           without needing the full multi-million-row dataset.
+|
+|-- data/
+|   |-- BattlesStaging_01012021_WL_tagged/
+|   |       Empty directory in this checkout (the raw ~2.8 million row CSV,
+|   |       BattlesStaging_01012021_WL_tagged.csv, would live here; it is
+|   |       excluded from git via .gitignore's `data/` rule since it's very
+|   |       large). This is the full raw dataset referenced by
+|   |       data_understanding.ipynb.
+|   |
+|   |-- CardMasterListSeason18_12082020.csv
+|   |       Reference/lookup table mapping card ids to card names for the
+|   |       Season 18 card roster (columns: team.card1.id, team.card1.name;
+|   |       e.g., 26000000 = Knight, 26000001 = Archers, etc.). Useful for
+|   |       translating numeric card ids in the main dataset into
+|   |       human-readable card names during EDA.
+|   |
+|   `-- Wincons.csv
+|           Reference table listing "win condition" cards (columns: id,
+|           card_id, card_name; e.g., Skeleton Barrel, Mortar, Royal Giant,
+|           Elixir Golem). Likely used or intended for use in EDA/feature
+|           engineering to flag whether a deck contains a primary win
+|           condition card. Not currently joined in by any script.
+|
+|-- screenshots/
+|   |-- CI-CD-1.png
+|   `-- CI-CD-2.png
+|           Screenshots documenting the GitHub Actions CI/CD pipeline runs
+|           (e.g., for the README or a report), showing successful pipeline
+|           executions in the Actions tab.
+|
+|-- mlruns/ , mlflow.db  (gitignored, created at runtime)
+|       MLflow's local tracking store. mlflow.db is a SQLite database
+|       holding run/experiment/registered-model metadata; mlruns/ holds
+|       logged artifacts (models, the confusion-matrix image, etc.).
+|       Inspect with: `mlflow ui --backend-store-uri sqlite:///mlflow.db`.
+|
+`-- artifacts/  (gitignored, created at runtime)
+        preprocessed_data.csv, model_ready_data.csv, scaler.pkl,
+        best_model.joblib, confusion_matrix.png -- see section 9 below.
+
+--------------------------------------------------------------------------------
+9. RAW DATA FORMAT (what's inside the source CSV)
+--------------------------------------------------------------------------------
+The original raw file (BattlesStaging_01012021_WL_tagged.csv, ~2.82 million
+rows, 74 columns) has one row per Clash Royale match, in "wide" format with
+separate winner.* and loser.* column groups, for example:
+
+  battleTime, arena.id, gameMode.id, average.startingTrophies,
+  winner.tag, winner.startingTrophies, winner.trophyChange, winner.crowns,
+  winner.kingTowerHitPoints, winner.princessTowersHitPoints,
+  winner.clan.tag, winner.clan.badgeId,
+  winner.card1.id ... winner.card8.id, winner.card1.level ... winner.card8.level,
+  winner.cards.list, winner.totalcard.level,
+  winner.troop.count, winner.structure.count, winner.spell.count,
+  winner.common.count, winner.rare.count, winner.epic.count,
+  winner.legendary.count, winner.elixir.average,
+  (and the same set of loser.* columns), plus tournamentTag.
+
+scripts/load_data.py is responsible for pivoting this wide, winner/loser
+oriented raw format into the normalized relational schema described in
+section 4.
+
+--------------------------------------------------------------------------------
+10. HOW TO RUN THE PROJECT (non-Docker)
+--------------------------------------------------------------------------------
+Requirements: Python 3.10+ and a reachable PostgreSQL server.
+
+1. Create/activate a virtual environment and install dependencies:
+     python -m venv .venv
+     .venv\Scripts\Activate.ps1        (Windows PowerShell)
+     pip install -r requirements.txt
+   (This installs mlflow and xgboost in addition to the data-engineering
+   dependencies.)
+
+2. Create a .env file in the project root with:
+     DB_HOST=127.0.0.1
+     DB_PORT=5432
+     DB_NAME=clash_royale
+     DB_USER=postgres
+     DB_PASSWORD=your_password_here
+   (The schema is created automatically on first run from schema.sql.)
+
+3. Run the whole thing, from raw CSV to predictions in the database:
+     python run_pipeline.py --csv-path "sample/sample.csv"
+   Useful flags: --limit-rows N, --chunk-size N (default 5000), --no-reset,
+   --seed N (default 42, controls both the A/B side assignment and the
+   train/val/test split).
+
+   To run only the data-engineering stages (no modeling), use the original
+   entry point instead:
+     python pipeline.py --csv-path "sample/sample.csv"
+
+   Or run every stage individually:
+     python -m scripts.load_data --csv-path "sample/sample.csv"
+     python -m scripts.preprocess
+     python -m scripts.feature_engineering
+     python -m scripts.train_model
+     python -m scripts.make_predictions
+   (Stages 2-5 read from the database, so any of them can be re-run on its
+   own once the stage(s) before it have populated their input table.)
+
+4. Inspect training experiments with the MLflow UI:
+     mlflow ui --backend-store-uri sqlite:///mlflow.db
+
+--------------------------------------------------------------------------------
+11. OUTPUTS SUMMARY
+--------------------------------------------------------------------------------
+  preprocessed_match      (Postgres table) cleaned, one row per match (w_*/l_*, match_id)
+  model_ready_match       (Postgres table) feature matrix (A_*/B_*/diff_*/ratio_*, target is_A_winner)
+  match_predictions       (Postgres table) match_id, predicted_label, predicted_probability, actual_is_A_winner
+  artifacts/preprocessed_data.csv   CSV copy of preprocessed_match
+  artifacts/model_ready_data.csv    CSV copy of model_ready_match
+  artifacts/scaler.pkl              fitted StandardScaler + column list (reused, not refit, at prediction time)
+  artifacts/best_model.joblib       best model + its feature column list (reused, not retrained, at prediction time)
+  artifacts/confusion_matrix.png    confusion matrix of the best model on the test set
+  MLflow runs (mlruns/, mlflow.db)  one run per candidate model: params, CV score, val/test metrics, model artifact
+  MLflow Model Registry entry       "clash_royale_winner_predictor" -- the registered best model
+  (artifacts/, mlruns/, and mlflow.db are all gitignored; they're generated
+  locally by running the pipeline.)
+
+--------------------------------------------------------------------------------
+12. CONTINUOUS INTEGRATION
+--------------------------------------------------------------------------------
+.github/workflows/ci.yml ("Data Pipeline CI") runs automatically on every
+push/PR to `main`. It spins up a throwaway Postgres 16 service container,
+installs dependencies, compile-checks all Python source, and runs
+pipeline.py (the data-engineering stages, 1-3) against sample/ci_sample.csv.
+A green check means the load -> preprocess -> feature-engineering pipeline
+works end to end. No real database or credentials are needed to run this -
+it is fully self-contained. It does not currently run the modeling stages
+(train_model.py / make_predictions.py / run_pipeline.py) -- see section 13.
+Screenshots of past successful runs are stored in screenshots/CI-CD-1.png
+and screenshots/CI-CD-2.png.
+
+--------------------------------------------------------------------------------
+13. POSSIBLE FOLLOW-UP WORK
+--------------------------------------------------------------------------------
+  - Extend .github/workflows/ci.yml to also run run_pipeline.py (or
+    train_model.py + make_predictions.py) against sample/ci_sample.csv, so
+    CI also exercises the modeling stages, not just data engineering.
+  - Wire scripts/make_predictions.py to load the model from the MLflow
+    Model Registry (e.g. "models:/clash_royale_winner_predictor/latest")
+    instead of (or in addition to) the local artifacts/best_model.joblib
+    file, for deployments where a shared MLflow tracking server is used.
+  - Use Wincons.csv / CardMasterListSeason18_12082020.csv within the
+    scripted pipeline itself (they currently appear to be reference data for
+    manual/EDA use rather than being joined in by the scripts) -- e.g. as a
+    "does this deck contain a win condition card" feature.
+================================================================================

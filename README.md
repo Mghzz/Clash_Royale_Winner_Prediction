@@ -1,10 +1,12 @@
 # Clash Royale Winner Prediction
 
-This project prepares a dataset for predicting the winner of a Clash Royale match.
-We treat winner prediction as a comparison between the two players, so each row is
-one match with both players' features and the target `is_A_winner`. This phase
-covers the data engineering side: a PostgreSQL database, a scripted import, and a
-preparation pipeline (cleaning, feature engineering, model-ready output).
+This project predicts the winner of a Clash Royale match. We treat winner
+prediction as a comparison between the two players, so each row is one match with
+both players' features and the target `is_A_winner`. The project has two parts:
+data engineering (a PostgreSQL database, a scripted import, and a preparation
+pipeline: cleaning, feature engineering, model-ready output) and modeling (model
+selection, training with hyperparameter tuning and MLflow tracking, evaluation,
+and a prediction script).
 
 ## Pipeline overview
 
@@ -36,8 +38,39 @@ and highly correlated columns, scales the numeric columns, and writes
 `model_ready_match`. The fitted scaler is saved to `artifacts/scaler.pkl`.
 
 Note on leakage: `crowns`, `kingTowerHitPoints`, `princessTowersHitPoints` and
-`trophyChange` are recorded after the match. They are kept in this phase but should
-be dropped for a real pre-match model later. The EDA already leaves them out.
+`trophyChange` are recorded after the match. They are kept in `model_ready_match`
+for completeness, but `scripts/train_model.py` drops them (and their `A_*`/`B_*`/
+`diff_*`/`ratio_*` variants) before training, since a real pre-match model must not
+see them. The EDA already leaves them out too.
+
+```
+table model_ready_match
+  -> scripts/train_model.py          stage 4: train, tune, evaluate, track in MLflow
+  -> artifacts/best_model.joblib (+ MLflow run + registered model)
+  -> scripts/make_predictions.py     stage 5: score new/held-out matches
+  -> table match_predictions
+```
+
+Stage 4 loads `model_ready_match`, drops the leakage columns above, and splits the
+data into train/validation/test (70/15/15, stratified on `is_A_winner`). It trains
+four candidate classifiers — Logistic Regression, Random Forest, XGBoost, and a
+neural network (`MLPClassifier`) — each with `GridSearchCV` (5-fold cross-validation
+plus a small regularization/hyperparameter grid). Every candidate run (params,
+cross-validation score, validation metrics, the fitted model) is logged to MLflow.
+The candidate with the best validation ROC-AUC is picked automatically — the four
+models, including the neural network, are compared on equal footing, so whichever
+genuinely performs best wins. That model is evaluated once on the held-out test set
+(accuracy, precision, recall, F1, ROC-AUC, confusion matrix), all logged to the same
+MLflow run, then registered in the MLflow Model Registry and saved to
+`artifacts/best_model.joblib` (model + feature column list) for reuse without
+retraining.
+
+Stage 5 loads `preprocessed_match`, rebuilds the same `A_*`/`B_*`/`diff_*`/`ratio_*`
+features with `scripts/feature_engineering.add_features()`, applies the **saved**
+scaler (`artifacts/scaler.pkl`, `.transform()` only, never refit) and the **saved**
+model (`artifacts/best_model.joblib`, no retraining), and writes `match_id`,
+`predicted_label`, `predicted_probability`, and (when available) `actual_is_A_winner`
+to the `match_predictions` table.
 
 ## Project structure
 
@@ -45,7 +78,8 @@ be dropped for a real pre-match model later. The EDA already leaves them out.
 Clash_Royale_Winner_Prediction/
 ├── schema.sql                      DB schema (single source of truth)
 ├── schema.png                      ER diagram
-├── pipeline.py                     runs all stages
+├── pipeline.py                     runs the data-engineering stages (1-3)
+├── run_pipeline.py                 runs the full pipeline (1-5), end to end
 ├── requirements.txt
 ├── Dockerfile                      container for the pipeline
 ├── docker-compose.yml              pipeline + Postgres for local testing
@@ -57,16 +91,21 @@ Clash_Royale_Winner_Prediction/
 │   ├── database_connection.py      engine, schema, read/write helpers, base query
 │   ├── load_data.py                stage 1
 │   ├── preprocess.py               stage 2
-│   └── feature_engineering.py      stage 3
+│   ├── feature_engineering.py      stage 3
+│   ├── train_model.py              stage 4: model selection, training, MLflow
+│   └── make_predictions.py         stage 5: score matches, write match_predictions
 ├── sample/
 │   └── ci_sample.csv               small sample used by CI and Docker
-└── artifacts/                      generated CSV / scaler (gitignored)
+├── mlruns/ , mlflow.db             MLflow tracking store (gitignored)
+└── artifacts/                      generated CSV / scaler / model (gitignored)
 ```
 
 ## Requirements
 
 - Python 3.10+
 - A running PostgreSQL server you can write to
+- `pip install -r requirements.txt` also installs `mlflow` and `xgboost`, used by
+  the modeling stages
 
 ## Setup
 
@@ -117,12 +156,32 @@ Or run the stages one at a time:
 python -m scripts.load_data --csv-path "sample/sample.csv"
 python -m scripts.preprocess
 python -m scripts.feature_engineering
+python -m scripts.train_model
+python -m scripts.make_predictions
 ```
 
-Stages 2 and 3 read from the database, so you can re-run them on their own after
-stage 1. Both accept `--input-path file.csv` to read a CSV instead of the database.
-Stage 3 also has `--corr-threshold` (default 0.95), `--scaler-path`, and `--seed`
-(default 42, controls the A/B side assignment).
+Stages 2-5 read from the database, so you can re-run any of them on their own once
+the stages before them have populated their input table. Stages 2, 3, and 5 accept
+`--input-path file.csv` to read a CSV instead of the database. Stage 3 also has
+`--corr-threshold` (default 0.95), `--scaler-path`, and `--seed` (default 42,
+controls the A/B side assignment). Stage 4 has `--seed` (controls the train/val/test
+split). Stage 5 has `--model-path` and `--scaler-path` (defaults point at the
+`artifacts/` files stage 4 and stage 3 produce).
+
+To run everything, including training and predictions, in one command:
+
+```powershell
+python run_pipeline.py --csv-path "sample/sample.csv"
+```
+
+It accepts the same flags as `pipeline.py` (`--limit-rows`, `--chunk-size`,
+`--no-reset`, `--seed`, etc.) and simply chains all five stages.
+
+After training, inspect the experiment runs with the MLflow UI:
+
+```powershell
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
 
 ## Outputs
 
@@ -130,9 +189,14 @@ Stage 3 also has `--corr-threshold` (default 0.95), `--scaler-path`, and `--seed
 | --- | --- | --- |
 | `preprocessed_match` | PostgreSQL table | cleaned, one row per match (`w_*` / `l_*`) |
 | `model_ready_match`  | PostgreSQL table | feature matrix (`A_*`/`B_*`/`diff_*`/`ratio_*`, target `is_A_winner`) |
+| `match_predictions`  | PostgreSQL table | `match_id`, `predicted_label`, `predicted_probability`, `actual_is_A_winner` |
 | `preprocessed_data.csv` | `artifacts/` | CSV copy of the preprocessed table |
 | `model_ready_data.csv`  | `artifacts/` | CSV copy of the model-ready table |
-| `scaler.pkl` | `artifacts/` | fitted scaler + column list, for reuse in modeling |
+| `scaler.pkl` | `artifacts/` | fitted scaler + column list, reused (not refit) at prediction time |
+| `best_model.joblib` | `artifacts/` | best model + its feature column list, reused (not retrained) at prediction time |
+| `confusion_matrix.png` | `artifacts/` | confusion matrix of the best model on the test set |
+| MLflow runs | `mlruns/`, `mlflow.db` | one run per candidate model: params, CV score, validation/test metrics, model artifact |
+| `clash_royale_winner_predictor` | MLflow Model Registry | registered best model |
 
 ## Exploratory data analysis
 

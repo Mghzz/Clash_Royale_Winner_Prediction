@@ -6,3 +6,5 @@ scikit-learn>=1.4
 python-dotenv>=1.0
 matplotlib>=3.8
 seaborn>=0.13
+mlflow>=2.14
+xgboost>=2.0

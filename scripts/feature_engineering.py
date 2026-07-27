@@ -21,6 +21,7 @@ from scripts.preprocess import preprocess_dataframe
 
 
 TARGET_COLUMN = "is_A_winner"
+ID_COLUMN = "match_id"
 SEED = 42
 
 AB_FEATURES = list(PER_SIDE_NUMERIC) + list(PER_SIDE_CARD_AGG) + ["clan_badge_id", "clan_tag_freq"]
@@ -29,6 +30,7 @@ RATIO_FEATURES = ["startingTrophies", "elixir_average", "avg_card_level", "total
 
 SCALER_EXCLUDE = {
     TARGET_COLUMN,
+    ID_COLUMN,
     "is_weekend",
     "hour_sin",
     "hour_cos",
@@ -117,7 +119,7 @@ def drop_redundant_features(
 ) -> pd.DataFrame:
     df = df.copy()
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    feature_cols = [c for c in numeric_cols if c != target]
+    feature_cols = [c for c in numeric_cols if c not in (target, ID_COLUMN)]
 
     near_constant = [c for c in feature_cols if df[c].nunique(dropna=False) <= 1]
     remaining = [c for c in feature_cols if c not in near_constant]

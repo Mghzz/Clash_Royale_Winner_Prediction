@@ -32,8 +32,6 @@ HP_COLUMNS = [
     f"{s}_{c}" for s in SIDES for c in ("kingTowerHitPoints", "princessTowersHitPoints")
 ]
 
-DROP_ID_COLUMNS = ["match_id"]
-
 
 def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -70,16 +68,13 @@ def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df["battle_month"] = df["battleTime"].dt.month.fillna(-1).astype("int64")
     df["is_weekend"] = df["battle_dayofweek"].isin([5, 6]).astype("int64")
 
-    for col in DROP_ID_COLUMNS:
-        if col in df.columns:
-            df = df.drop(columns=[col])
-
     for col in CATEGORICAL_COLUMNS:
         if col in df.columns:
             freq = df[col].value_counts(normalize=True, dropna=False)
             df[f"{col}_freq"] = df[col].map(freq).fillna(0.0).astype(float)
 
-    df = df.drop_duplicates()
+    dedup_subset = [c for c in df.columns if c != "match_id"]
+    df = df.drop_duplicates(subset=dedup_subset)
 
     return df
 
