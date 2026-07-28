@@ -5,11 +5,13 @@ import ast
 from pathlib import Path
 from typing import List, Optional, Sequence
 
+import mlflow
 import numpy as np
 import pandas as pd
 from psycopg2.extras import execute_values
 
 from scripts.database_connection import ensure_schema, get_engine, reset_tables
+from scripts.mlflow_helper import stage_run
 
 
 PRINCESS_HP_COLUMNS = [
@@ -190,64 +192,80 @@ def load_csv_to_postgres(
     reset: bool = True,
     limit_rows: Optional[int] = None,
 ) -> None:
-    engine = get_engine()
-    ensure_schema(engine)
-    if reset:
-        reset_tables(engine)
+    with stage_run("data_loading", tags={"stage": "1_load"}):
+        mlflow.log_params({
+            "csv_path": str(csv_path),
+            "chunk_size": chunk_size,
+            "reset": reset,
+            "limit_rows": limit_rows or -1,
+        })
 
-    seen_cards = set()
-    seen_clans = set()
-    match_id = 1
-    player_id = 1
-    total_rows = 0
+        engine = get_engine()
+        ensure_schema(engine)
+        if reset:
+            reset_tables(engine)
 
-    reader = pd.read_csv(
-        csv_path,
-        chunksize=chunk_size,
-        low_memory=False,
-        nrows=limit_rows,
-    )
+        seen_cards = set()
+        seen_clans = set()
+        match_id = 1
+        player_id = 1
+        total_rows = 0
 
-    for chunk_idx, chunk in enumerate(reader, start=1):
-        if chunk.empty:
-            continue
-
-        match_df, player_df, player_card_df, card_df, clan_df, match_id, player_id = prepare_chunk(
-            chunk, match_id, player_id
+        reader = pd.read_csv(
+            csv_path,
+            chunksize=chunk_size,
+            low_memory=False,
+            nrows=limit_rows,
         )
 
-        if not clan_df.empty:
-            clan_df = clan_df[clan_df["tag"].notna()]
-            clan_df = clan_df[~clan_df["tag"].isin(seen_clans)]
+        for chunk_idx, chunk in enumerate(reader, start=1):
+            if chunk.empty:
+                continue
+
+            match_df, player_df, player_card_df, card_df, clan_df, match_id, player_id = prepare_chunk(
+                chunk, match_id, player_id
+            )
+
             if not clan_df.empty:
-                seen_clans.update(clan_df["tag"].tolist())
+                clan_df = clan_df[clan_df["tag"].notna()]
+                clan_df = clan_df[~clan_df["tag"].isin(seen_clans)]
+                if not clan_df.empty:
+                    seen_clans.update(clan_df["tag"].tolist())
 
-        if not card_df.empty:
-            card_df = card_df[~card_df["id"].isin(seen_cards)]
             if not card_df.empty:
-                seen_cards.update(card_df["id"].tolist())
+                card_df = card_df[~card_df["id"].isin(seen_cards)]
+                if not card_df.empty:
+                    seen_cards.update(card_df["id"].tolist())
 
-        match_df = match_df.dropna(subset=["id"])
-        player_df = player_df.dropna(subset=["id", "match_id"])
-        player_card_df = player_card_df.dropna(subset=["match_player_id", "card_id"])
-        card_df = card_df.dropna(subset=["id"])
-        clan_df = clan_df.dropna(subset=["tag"])
+            match_df = match_df.dropna(subset=["id"])
+            player_df = player_df.dropna(subset=["id", "match_id"])
+            player_card_df = player_card_df.dropna(subset=["match_player_id", "card_id"])
+            card_df = card_df.dropna(subset=["id"])
+            clan_df = clan_df.dropna(subset=["tag"])
 
-        print(
-            f"[chunk {chunk_idx}] matches={len(match_df)} players={len(player_df)} "
-            f"player_cards={len(player_card_df)} cards={len(card_df)} clans={len(clan_df)}"
-        )
+            print(
+                f"[chunk {chunk_idx}] matches={len(match_df)} players={len(player_df)} "
+                f"player_cards={len(player_card_df)} cards={len(card_df)} clans={len(clan_df)}"
+            )
 
-        insert_dataframe(engine, "Match", match_df, batch_size=5000)
-        insert_dataframe(engine, "Clan", clan_df, batch_size=5000)
-        insert_dataframe(engine, "Card", card_df, batch_size=5000)
-        insert_dataframe(engine, "MatchPlayer", player_df, batch_size=5000)
-        insert_dataframe(engine, "MatchPlayerCard", player_card_df, batch_size=10000)
+            insert_dataframe(engine, "Match", match_df, batch_size=5000)
+            insert_dataframe(engine, "Clan", clan_df, batch_size=5000)
+            insert_dataframe(engine, "Card", card_df, batch_size=5000)
+            insert_dataframe(engine, "MatchPlayer", player_df, batch_size=5000)
+            insert_dataframe(engine, "MatchPlayerCard", player_card_df, batch_size=10000)
 
-        total_rows += len(chunk)
-        print(f"Processed rows: {total_rows}")
+            total_rows += len(chunk)
+            print(f"Processed rows: {total_rows}")
 
-    print("Load finished successfully.")
+        mlflow.log_metrics({
+            "total_rows_loaded": total_rows,
+            "total_cards_seen": len(seen_cards),
+            "total_clans_seen": len(seen_clans),
+            "final_match_id": match_id - 1,
+            "final_player_id": player_id - 1,
+        })
+
+        print("Load finished successfully.")
 
 
 def main():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import mlflow
 
 import numpy as np
 import pandas as pd
@@ -15,6 +16,7 @@ from scripts.database_connection import (
     get_engine,
     write_table,
 )
+from scripts.mlflow_helper import stage_run
 
 
 SIDES = ("w", "l")
@@ -59,6 +61,8 @@ def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].astype("string").fillna("unknown").str.strip()
             df.loc[df[col] == "", col] = "unknown"
 
+
+
     for col in HP_COLUMNS:
         if col in df.columns:
             df[col] = df[col].clip(lower=0)
@@ -84,26 +88,41 @@ def run_preprocess(
     input_path: Path | None = None,
     table_name: str = PREPROCESSED_TABLE,
 ) -> pd.DataFrame:
-    engine = get_engine()
 
-    if input_path is None:
-        query = build_match_base_query()
-        df = pd.read_sql_query(query, engine)
-    else:
-        df = pd.read_csv(input_path)
+    with stage_run("preprocessing", tags={"stage": "2_preprocess"}):
+        mlflow.log_params({
+            "input_source": "csv" if input_path else "database",
+            "input_path": str(input_path) if input_path else None,
+            "output_path": str(output_path) if output_path else None,
+            "table_name": table_name,
+        })
+        engine = get_engine()
 
-    cleaned = preprocess_dataframe(df)
+        if input_path is None:
+            query = build_match_base_query()
+            df = pd.read_sql_query(query, engine)
+        else:
+            df = pd.read_csv(input_path)
 
-    write_table(engine, cleaned, table_name)
-    print(f"Preprocessed dataset written to DB table: {table_name}")
+        mlflow.log_metric("input_rows", len(df))
+        mlflow.log_metric("input_columns", len(df.columns))
 
-    if output_path is not None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        cleaned.to_csv(output_path, index=False)
-        print(f"Preprocessed dataset saved to: {output_path}")
+        cleaned = preprocess_dataframe(df)
 
-    print(f"Shape: {cleaned.shape}")
-    return cleaned
+        mlflow.log_metric("output_rows", len(cleaned))
+        mlflow.log_metric("output_columns", len(cleaned.columns))
+        mlflow.log_metric("columns_dropped", len(df.columns) - len(cleaned.columns))
+
+        write_table(engine, cleaned, table_name)
+        print(f"Preprocessed dataset written to DB table: {table_name}")
+
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            cleaned.to_csv(output_path, index=False)
+            print(f"Preprocessed dataset saved to: {output_path}")
+
+        print(f"Shape: {cleaned.shape}")
+        return cleaned
 
 
 def main():

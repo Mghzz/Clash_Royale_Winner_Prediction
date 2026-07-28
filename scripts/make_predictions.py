@@ -4,10 +4,12 @@ import argparse
 from pathlib import Path
 
 import joblib
+import mlflow
 import pandas as pd
 
 from scripts.database_connection import PREPROCESSED_TABLE, get_engine, read_table, write_table
 from scripts.feature_engineering import SEED, add_features
+from scripts.mlflow_helper import stage_run
 
 
 BEST_MODEL_PATH = Path("artifacts/best_model.joblib")
@@ -66,25 +68,41 @@ def run_predictions(
     model_path: Path = BEST_MODEL_PATH,
     scaler_path: Path = SCALER_PATH,
 ) -> pd.DataFrame:
-    engine = get_engine()
+    with stage_run("prediction", tags={"stage": "5_prediction"}):
+        mlflow.log_params({
+            "input_source": "csv" if input_path else "database",
+            "input_path": str(input_path) if input_path else None,
+            "source_table": table_name,
+            "predictions_table": predictions_table,
+            "model_path": str(model_path),
+            "scaler_path": str(scaler_path),
+        })
 
-    if input_path is None:
-        df = read_table(engine, table_name)
-        assume_preprocessed = True
-    else:
-        df = pd.read_csv(input_path)
-        assume_preprocessed = False
+        engine = get_engine()
 
-    model_bundle = load_model_bundle(model_path)
-    scaler_bundle = load_scaler_bundle(scaler_path)
+        if input_path is None:
+            df = read_table(engine, table_name)
+            assume_preprocessed = True
+        else:
+            df = pd.read_csv(input_path)
+            assume_preprocessed = False
 
-    predictions = predict(df, model_bundle, scaler_bundle, assume_preprocessed=assume_preprocessed)
+        mlflow.log_metric("input_rows", len(df))
 
-    write_table(engine, predictions, predictions_table, if_exists="replace")
-    print(f"Wrote {len(predictions)} predictions to table: {predictions_table}")
-    print(predictions.head())
+        model_bundle = load_model_bundle(model_path)
+        scaler_bundle = load_scaler_bundle(scaler_path)
+        mlflow.log_metric("model_name", hash(model_bundle["model_name"]) % 10000)
 
-    return predictions
+        predictions = predict(df, model_bundle, scaler_bundle, assume_preprocessed=assume_preprocessed)
+
+        mlflow.log_metric("num_predictions", len(predictions))
+        mlflow.log_metric("predicted_positive_rate", float(predictions["predicted_label"].mean()))
+
+        write_table(engine, predictions, predictions_table, if_exists="replace")
+        print(f"Wrote {len(predictions)} predictions to table: {predictions_table}")
+        print(predictions.head())
+
+        return predictions
 
 
 def main():

@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 import joblib
+import mlflow
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
@@ -17,6 +18,7 @@ from scripts.database_connection import (
     read_table,
     write_table,
 )
+from scripts.mlflow_helper import stage_run
 from scripts.preprocess import preprocess_dataframe
 
 
@@ -174,28 +176,47 @@ def run_feature_engineering(
     scaler_path: Path | None = Path("artifacts/scaler.pkl"),
     seed: int = SEED,
 ) -> pd.DataFrame:
-    engine = get_engine()
+    with stage_run("feature_engineering", tags={"stage": "3_feature_engineering"}):
+        mlflow.log_params({
+            "input_source": "csv" if input_path else "database",
+            "source_table": source_table,
+            "output_table": table_name,
+            "corr_threshold": corr_threshold,
+            "scaler_path": str(scaler_path) if scaler_path else None,
+            "seed": seed,
+        })
 
-    if input_path is None:
-        df = read_table(engine, source_table)
-        featured = add_features(df, assume_preprocessed=True, seed=seed)
-    else:
-        df = pd.read_csv(input_path)
-        featured = add_features(df, assume_preprocessed=False, seed=seed)
+        engine = get_engine()
 
-    featured = drop_redundant_features(featured, corr_threshold=corr_threshold)
-    featured, _ = standardize_features(featured, scaler_path=scaler_path)
+        if input_path is None:
+            df = read_table(engine, source_table)
+            featured = add_features(df, assume_preprocessed=True, seed=seed)
+        else:
+            df = pd.read_csv(input_path)
+            featured = add_features(df, assume_preprocessed=False, seed=seed)
 
-    write_table(engine, featured, table_name)
-    print(f"Feature-engineered dataset written to DB table: {table_name}")
+        mlflow.log_metric("input_rows", len(featured))
+        mlflow.log_metric("input_columns", len(featured.columns))
 
-    if output_path is not None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        featured.to_csv(output_path, index=False)
-        print(f"Feature-engineered dataset saved to: {output_path}")
+        featured = drop_redundant_features(featured, corr_threshold=corr_threshold)
+        mlflow.log_metric("columns_after_feature_selection", len(featured.columns))
 
-    print(f"Shape: {featured.shape}")
-    return featured
+        featured, scaler = standardize_features(featured, scaler_path=scaler_path)
+        mlflow.log_metric("scaled_columns", scaler.n_features_in_ if scaler is not None else 0)
+
+        mlflow.log_metric("output_rows", len(featured))
+        mlflow.log_metric("output_columns", len(featured.columns))
+
+        write_table(engine, featured, table_name)
+        print(f"Feature-engineered dataset written to DB table: {table_name}")
+
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            featured.to_csv(output_path, index=False)
+            print(f"Feature-engineered dataset saved to: {output_path}")
+
+        print(f"Shape: {featured.shape}")
+        return featured
 
 
 def main():
