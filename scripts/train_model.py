@@ -27,83 +27,7 @@ from sklearn.neural_network import MLPClassifier
 from xgboost import XGBClassifier
 
 from scripts.database_connection import FEATURES_TABLE, get_engine, read_table
-import torch
-import numpy as np
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.base import BaseEstimator, ClassifierMixin
 
-class TabularNN(nn.Module):
-    def __init__(self, input_dim, hidden_size, dropout):
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, hidden_size),
-            nn.BatchNorm1d(hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.BatchNorm1d(hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(hidden_size // 2, 1)
-        )
-
-    def forward(self, x):
-        return self.network(x)
-
-
-class PyTorchTabularClassifier(BaseEstimator, ClassifierMixin):
-    def __init__(self, hidden_size=128, dropout=0.3, lr=0.001, epochs=30, batch_size=256):
-        self.hidden_size = hidden_size
-        self.dropout = dropout
-        self.lr = lr
-        self.epochs = epochs
-        self.batch_size = batch_size
-        self.model_ = None
-    
-    def fit(self, X, y):
-        # Handle pandas DataFrames/Series
-        X_vals = X.values if hasattr(X, "values") else X
-        y_vals = y.values if hasattr(y, "values") else y
-
-        self.classes_ = np.unique(y_vals)
-        
-        X_tensor = torch.FloatTensor(X_vals)
-        y_tensor = torch.FloatTensor(y_vals).unsqueeze(1)
-        
-        dataset = TensorDataset(X_tensor, y_tensor)
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-        
-        self.model_ = TabularNN(input_dim=X_tensor.shape[1], hidden_size=self.hidden_size, dropout=self.dropout)
-        criterion = nn.BCEWithLogitsLoss()
-        optimizer = optim.Adam(self.model_.parameters(), lr=self.lr)
-        
-        self.model_.train()
-        for epoch in range(self.epochs):
-            for batch_X, batch_y in loader:
-                optimizer.zero_grad()
-                outputs = self.model_(batch_X)
-                loss = criterion(outputs, batch_y)
-                loss.backward()
-                optimizer.step()
-        return self
-        
-    def predict_proba(self, X):
-        self.model_.eval()
-        X_tensor = torch.FloatTensor(X.values if hasattr(X, "values") else X)
-        with torch.no_grad():
-            logits = self.model_(X_tensor)
-            probs = torch.sigmoid(logits).numpy()
-            
-        # scikit-learn requires shape (N, 2) for binary classification probabilities
-        return np.hstack([1 - probs, probs])
-        
-    def predict(self, X):
-        probs = self.predict_proba(X)
-        return (probs[:, 1] >= 0.5).astype(int)
 
 
 TARGET_COLUMN = "is_A_winner"
@@ -141,14 +65,12 @@ MODEL_CANDIDATES = {
         },
     },
     "neural_network": {
-            "estimator": PyTorchTabularClassifier(),
-            "param_grid": {
-                "hidden_size": [128, 256],
-                "dropout": [0.2, 0.4],
-                "lr": [0.001, 0.0005],
-                "epochs": [30] # Keep low during grid search to save time
-            },
+        "estimator": MLPClassifier(max_iter=300, early_stopping=True, random_state=SEED),
+        "param_grid": {
+            "hidden_layer_sizes": [(32,), (64, 32)],
+            "alpha": [0.0001, 0.001, 0.01],
         },
+    }
 }
 
 
