@@ -51,10 +51,13 @@ def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in NUMERIC_COLUMNS:
         if col in df.columns:
-            median = df[col].median()
-            if pd.isna(median):
-                median = 0
-            df[col] = df[col].fillna(median)
+            if col != "w_clan_badge_id" and col != "l_clan_badge_id":
+                median = df[col].median()
+                if pd.isna(median):
+                    median = 0
+                df[col] = df[col].fillna(median)
+            else:
+                df[col] = 0
 
     for col in CATEGORICAL_COLUMNS:
         if col in df.columns:
